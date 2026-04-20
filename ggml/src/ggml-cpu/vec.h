@@ -26,9 +26,10 @@ extern "C" {
 #endif
 
 #if defined(__riscv_v_intrinsic)
-// Forward declaration for RVV helpers used by some vec_* implementations
+// Forward declarations for RVV helpers used by some vec_* implementations
 // before the helpers themselves are defined later in this header.
 static inline vfloat32m2_t ggml_v_expf_m2(vfloat32m2_t x, int vl);
+static inline vfloat32m2_t ggml_v_logf_m2(vfloat32m2_t x, int vl);
 #endif
 
 //
@@ -965,7 +966,17 @@ inline static void ggml_vec_sqrt_f16 (const int n, ggml_fp16_t * y, const ggml_f
         y[i] = GGML_CPU_FP32_TO_FP16(sqrtf(GGML_CPU_FP16_TO_FP32(x[i])));
     }
 }
-inline static void ggml_vec_log_f32  (const int n, float * y, const float * x) { for (int i = 0; i < n; ++i) y[i] = logf(x[i]);  }
+inline static void ggml_vec_log_f32  (const int n, float * y, const float * x) {
+#if defined(__riscv_v_intrinsic)
+    for (int i = 0, avl; i < n; i += avl) {
+        avl = __riscv_vsetvl_e32m2(n - i);
+        vfloat32m2_t vx = __riscv_vle32_v_f32m2(x + i, avl);
+        __riscv_vse32_v_f32m2(y + i, ggml_v_logf_m2(vx, avl), avl);
+    }
+#else
+    for (int i = 0; i < n; ++i) y[i] = logf(x[i]);
+#endif
+}
 inline static void ggml_vec_log_f16 (const int n, ggml_fp16_t * y, const ggml_fp16_t * x) {
     for (int i = 0; i < n; ++i) {
         y[i] = GGML_CPU_FP32_TO_FP16(logf(GGML_CPU_FP16_TO_FP32(x[i])));
@@ -1601,6 +1612,41 @@ inline static vfloat32m2_t ggml_v_silu_m2(vfloat32m2_t x, int vl) {
     const vfloat32m2_t exp_neg_x = ggml_v_expf_m2(neg_x, vl);
     const vfloat32m2_t one_plus_exp_neg_x = __riscv_vfadd_vf_f32m2(exp_neg_x, 1.0f, vl);
     return __riscv_vfdiv_vv_f32m2(x, one_plus_exp_neg_x, vl);
+}
+
+// Natural logarithm for single-precision vectors via
+//   log(x) = 2 * e * log(2)/2 + 2 * atanh((m-1)/(m+1))   with m in [~0.707, ~1.414)
+// and atanh(u) ≈ u + u^3/3 + u^5/5 + u^7/7 (Horner) over the reduced range.
+// Handles x <= 0 by returning NaN via the native fsqrt of a negative (sets v0);
+// intended for positive inputs typical in ggml (norms, losses, diagnostics).
+inline static vfloat32m2_t ggml_v_logf_m2(vfloat32m2_t x, int vl) {
+    // split x = m * 2^e with m in [sqrt(0.5), sqrt(2))
+    vuint32m2_t bits = __riscv_vreinterpret_v_f32m2_u32m2(x);
+    vint32m2_t  exp  = __riscv_vsub_vx_i32m2(
+                          __riscv_vreinterpret_v_u32m2_i32m2(__riscv_vsrl_vx_u32m2(bits, 23, vl)),
+                          127, vl);
+    // mantissa bits with exponent forced to 127 (=> m in [1, 2))
+    vuint32m2_t mant_bits = __riscv_vor_vx_u32m2(
+                               __riscv_vand_vx_u32m2(bits, 0x007FFFFFu, vl),
+                               0x3F800000u, vl);
+    vfloat32m2_t m = __riscv_vreinterpret_v_u32m2_f32m2(mant_bits);
+    // if m > sqrt(2) ≈ 1.4142: halve it, bump e by 1 (range-reduce to [~0.707, ~1.414))
+    vbool16_t big = __riscv_vmfgt_vf_f32m2_b16(m, 1.4142135f, vl);
+    m = __riscv_vfmul_vf_f32m2_mu(big, m, m, 0.5f, vl);
+    exp = __riscv_vadd_vx_i32m2_mu(big, exp, exp, 1, vl);
+    // u = (m - 1) / (m + 1); atanh(u) series
+    vfloat32m2_t u  = __riscv_vfdiv_vv_f32m2(
+                         __riscv_vfsub_vf_f32m2(m, 1.0f, vl),
+                         __riscv_vfadd_vf_f32m2(m, 1.0f, vl), vl);
+    vfloat32m2_t u2 = __riscv_vfmul_vv_f32m2(u, u, vl);
+    // Horner: u + u*(u²/3 + u²*(u²/5 + u²/7))
+    vfloat32m2_t t  = __riscv_vfmadd_vf_f32m2(u2, 1.0f/7.0f, __riscv_vfmv_v_f_f32m2(1.0f/5.0f, vl), vl);
+    t = __riscv_vfmadd_vv_f32m2(u2, t, __riscv_vfmv_v_f_f32m2(1.0f/3.0f, vl), vl);
+    t = __riscv_vfmadd_vv_f32m2(u2, t, __riscv_vfmv_v_f_f32m2(1.0f,     vl), vl);
+    vfloat32m2_t logm = __riscv_vfmul_vv_f32m2(__riscv_vfmul_vf_f32m2(u, 2.0f, vl), t, vl);
+    // final: log(x) = e*ln(2) + logm
+    vfloat32m2_t ef = __riscv_vfcvt_f_x_v_f32m2(exp, vl);
+    return __riscv_vfmadd_vf_f32m2(ef, 0.6931471806f, logm, vl);
 }
 
 #endif // __ARM_NEON / __AVX2__ / __SSE2__ / __riscv_v_intrinsic
