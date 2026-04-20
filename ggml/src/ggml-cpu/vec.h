@@ -949,7 +949,17 @@ inline static void ggml_vec_sqr_f16 (const int n, ggml_fp16_t * y, const ggml_fp
         y[i] = GGML_CPU_FP32_TO_FP16(v*v);
     }
 }
-inline static void ggml_vec_sqrt_f32 (const int n, float * y, const float * x) { for (int i = 0; i < n; ++i) y[i] = sqrtf(x[i]); }
+inline static void ggml_vec_sqrt_f32 (const int n, float * y, const float * x) {
+#if defined(__riscv_v_intrinsic)
+    for (int i = 0, avl; i < n; i += avl) {
+        avl = __riscv_vsetvl_e32m4(n - i);
+        vfloat32m4_t vx = __riscv_vle32_v_f32m4(x + i, avl);
+        __riscv_vse32_v_f32m4(y + i, __riscv_vfsqrt_v_f32m4(vx, avl), avl);
+    }
+#else
+    for (int i = 0; i < n; ++i) y[i] = sqrtf(x[i]);
+#endif
+}
 inline static void ggml_vec_sqrt_f16 (const int n, ggml_fp16_t * y, const ggml_fp16_t * x) {
     for (int i = 0; i < n; ++i) {
         y[i] = GGML_CPU_FP32_TO_FP16(sqrtf(GGML_CPU_FP16_TO_FP32(x[i])));
@@ -1110,7 +1120,17 @@ inline static void ggml_vec_hardsigmoid_f16 (const int n, ggml_fp16_t * y, const
         y[i] = GGML_CPU_FP32_TO_FP16(fminf(1.0f, fmaxf(0.0f, (GGML_CPU_FP16_TO_FP32(x[i]) + 3.0f) / 6.0f)));
     }
 }
-inline static void ggml_vec_exp_f32 (const int n, float * y, const float * x) { for (int i = 0; i < n; ++i) y[i] = expf(x[i]); }
+inline static void ggml_vec_exp_f32 (const int n, float * y, const float * x) {
+#if defined(__riscv_v_intrinsic)
+    for (int i = 0, avl; i < n; i += avl) {
+        avl = __riscv_vsetvl_e32m2(n - i);
+        vfloat32m2_t vx = __riscv_vle32_v_f32m2(x + i, avl);
+        __riscv_vse32_v_f32m2(y + i, ggml_v_expf_m2(vx, avl), avl);
+    }
+#else
+    for (int i = 0; i < n; ++i) y[i] = expf(x[i]);
+#endif
+}
 inline static void ggml_vec_exp_f16 (const int n, ggml_fp16_t * y, const ggml_fp16_t * x) {
     for (int i = 0; i < n; ++i) {
         y[i] = GGML_CPU_FP32_TO_FP16(expf(GGML_CPU_FP16_TO_FP32(x[i])));
