@@ -32,6 +32,7 @@ static inline vfloat32m2_t ggml_v_expf_m2(vfloat32m2_t x, int vl);
 static inline vfloat32m2_t ggml_v_logf_m2(vfloat32m2_t x, int vl);
 static inline vfloat32m2_t ggml_v_sinf_m2(vfloat32m2_t x, int vl);
 static inline vfloat32m2_t ggml_v_cosf_m2(vfloat32m2_t x, int vl);
+static inline vfloat32m2_t ggml_v_erff_m2(vfloat32m2_t x, int vl);
 #endif
 
 //
@@ -1032,7 +1033,23 @@ inline static void ggml_vec_abs_f16 (const int n, ggml_fp16_t * y, const ggml_fp
         y[i] = GGML_CPU_FP32_TO_FP16(fabsf(GGML_CPU_FP16_TO_FP32(x[i])));
     }
 }
-inline static void ggml_vec_sgn_f32  (const int n, float * y, const float * x) { for (int i = 0; i < n; ++i) y[i] = (x[i] > 0.f) ? 1.f : ((x[i] < 0.f) ? -1.f : 0.f); }
+inline static void ggml_vec_sgn_f32  (const int n, float * y, const float * x) {
+#if defined(__riscv_v_intrinsic)
+    // y = 0 by default; +1 where x>0; -1 where x<0
+    for (int i = 0, avl; i < n; i += avl) {
+        avl = __riscv_vsetvl_e32m4(n - i);
+        vfloat32m4_t vx  = __riscv_vle32_v_f32m4(x + i, avl);
+        vfloat32m4_t out = __riscv_vfmv_v_f_f32m4(0.0f, avl);
+        vbool8_t gt = __riscv_vmfgt_vf_f32m4_b8(vx, 0.0f, avl);
+        vbool8_t lt = __riscv_vmflt_vf_f32m4_b8(vx, 0.0f, avl);
+        out = __riscv_vfmerge_vfm_f32m4(out,  1.0f, gt, avl);
+        out = __riscv_vfmerge_vfm_f32m4(out, -1.0f, lt, avl);
+        __riscv_vse32_v_f32m4(y + i, out, avl);
+    }
+#else
+    for (int i = 0; i < n; ++i) y[i] = (x[i] > 0.f) ? 1.f : ((x[i] < 0.f) ? -1.f : 0.f);
+#endif
+}
 inline static void ggml_vec_sgn_f16 (const int n, ggml_fp16_t * y, const ggml_fp16_t * x) {
     for (int i = 0; i < n; ++i) {
         float v = GGML_CPU_FP16_TO_FP32(x[i]);
@@ -1242,7 +1259,22 @@ inline static void ggml_vec_gelu_f32(const int n, float * y, const float * x) {
 #endif
 
 inline static void ggml_vec_gelu_erf_f32(const int n, float * y, const float * x) {
-    for (int i = 0; i < n; ++i) {
+    int i = 0;
+#if defined(__riscv_v_intrinsic)
+    for (int avl; i < n; i += avl) {
+        avl = __riscv_vsetvl_e32m2(n - i);
+        vfloat32m2_t vx = __riscv_vle32_v_f32m2(x + i, avl);
+        vfloat32m2_t arg = __riscv_vfmul_vf_f32m2(vx, SQRT_2_INV, avl);
+        vfloat32m2_t e   = ggml_v_erff_m2(arg, avl);
+        vfloat32m2_t res = __riscv_vfmul_vf_f32m2(
+                             __riscv_vfmul_vv_f32m2(vx,
+                               __riscv_vfadd_vf_f32m2(e, 1.0f, avl), avl),
+                             0.5f, avl);
+        __riscv_vse32_v_f32m2(y + i, res, avl);
+    }
+    return;
+#endif
+    for (; i < n; ++i) {
         float xi = x[i];
         y[i] = 0.5f*xi*(1.0f + erff(xi*SQRT_2_INV));
     }
@@ -1711,6 +1743,32 @@ inline static vfloat32m2_t ggml_v_sinf_m2(vfloat32m2_t x, int vl) {
 inline static vfloat32m2_t ggml_v_cosf_m2(vfloat32m2_t x, int vl) {
     // cos(x) = sin(x + π/2)
     return ggml_v_sinf_m2(__riscv_vfadd_vf_f32m2(x, 1.5707963267948966f, vl), vl);
+}
+
+// Error function approximation (Abramowitz & Stegun 7.1.26, max err 1.5e-7)
+//   erf(x) = sign(x) * (1 - (a1*t + a2*t² + a3*t³ + a4*t⁴ + a5*t⁵) * exp(-x²))
+//   t = 1 / (1 + p*|x|),  p = 0.3275911,  a = [0.254829592, -0.284496736,
+//                         1.421413741, -1.453152027, 1.061405429]
+inline static vfloat32m2_t ggml_v_erff_m2(vfloat32m2_t x, int vl) {
+    vfloat32m2_t ax = __riscv_vfabs_v_f32m2(x, vl);
+    vfloat32m2_t t  = __riscv_vfrdiv_vf_f32m2(
+                         __riscv_vfmadd_vf_f32m2(ax, 0.3275911f, __riscv_vfmv_v_f_f32m2(1.0f, vl), vl),
+                         1.0f, vl);
+    // Horner: ((((a5*t + a4)*t + a3)*t + a2)*t + a1) * t
+    vfloat32m2_t poly = __riscv_vfmadd_vf_f32m2(t,  1.061405429f, __riscv_vfmv_v_f_f32m2(-1.453152027f, vl), vl);
+    poly = __riscv_vfmadd_vv_f32m2(t, poly, __riscv_vfmv_v_f_f32m2( 1.421413741f, vl), vl);
+    poly = __riscv_vfmadd_vv_f32m2(t, poly, __riscv_vfmv_v_f_f32m2(-0.284496736f, vl), vl);
+    poly = __riscv_vfmadd_vv_f32m2(t, poly, __riscv_vfmv_v_f_f32m2( 0.254829592f, vl), vl);
+    poly = __riscv_vfmul_vv_f32m2(t, poly, vl);
+    // exp(-x²)
+    vfloat32m2_t mxx = __riscv_vfneg_v_f32m2(__riscv_vfmul_vv_f32m2(x, x, vl), vl);
+    vfloat32m2_t e   = ggml_v_expf_m2(mxx, vl);
+    // result = sign(x) * (1 - poly * exp(-x²))
+    vfloat32m2_t ay  = __riscv_vfrsub_vf_f32m2(__riscv_vfmul_vv_f32m2(poly, e, vl), 1.0f, vl);
+    // apply sign of x: copy sign bit from x to ay
+    vuint32m2_t sign_mask = __riscv_vand_vx_u32m2(__riscv_vreinterpret_v_f32m2_u32m2(x), 0x80000000u, vl);
+    vuint32m2_t ay_bits   = __riscv_vand_vx_u32m2(__riscv_vreinterpret_v_f32m2_u32m2(ay), 0x7FFFFFFFu, vl);
+    return __riscv_vreinterpret_v_u32m2_f32m2(__riscv_vor_vv_u32m2(sign_mask, ay_bits, vl));
 }
 
 #endif // __ARM_NEON / __AVX2__ / __SSE2__ / __riscv_v_intrinsic
