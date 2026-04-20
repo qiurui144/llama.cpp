@@ -1124,8 +1124,32 @@ inline static void ggml_vec_gelu_erf_f16(const int n, ggml_fp16_t * y, const ggm
 
 #ifdef GGML_GELU_FP16
 inline static void ggml_vec_gelu_f32(const int n, float * y, const float * x) {
+    int i = 0;
+#if defined(__riscv_v_intrinsic) && defined(__riscv_zvfh)
+    // Vector gather from the precomputed FP16 table.
+    // Clamp-then-lookup matches scalar: y[i] = 0 for x<=-10, x for x>=10, else table[f16(x)].
+    for (int avl; i < n; i += avl) {
+        avl = __riscv_vsetvl_e32m2(n - i);
+        vfloat32m2_t vx = __riscv_vle32_v_f32m2(x + i, avl);
+        // bool masks for the two extreme branches
+        vbool16_t m_lo = __riscv_vmfle_vf_f32m2_b16(vx, -10.0f, avl);
+        vbool16_t m_hi = __riscv_vmfge_vf_f32m2_b16(vx,  10.0f, avl);
+        // mid-range: FP32 -> FP16 -> u16 index -> u32 byte offset
+        vfloat16m1_t vxh = __riscv_vfncvt_f_f_w_f16m1(vx, avl);
+        vuint16m1_t  idx = __riscv_vreinterpret_v_f16m1_u16m1(vxh);
+        vuint32m2_t  off = __riscv_vsll_vx_u32m2(__riscv_vzext_vf2_u32m2(idx, avl), 1, avl);
+        vuint16m1_t  loaded = __riscv_vloxei32_v_u16m1((const uint16_t *)ggml_table_gelu_f16, off, avl);
+        vfloat16m1_t loaded_h = __riscv_vreinterpret_v_u16m1_f16m1(loaded);
+        vfloat32m2_t mid = __riscv_vfwcvt_f_f_v_f32m2(loaded_h, avl);
+        // apply branches: x<=-10 -> 0; x>=10 -> x; else -> mid
+        vfloat32m2_t out = __riscv_vmerge_vvm_f32m2(mid, vx, m_hi, avl);
+        out = __riscv_vfmerge_vfm_f32m2(out, 0.0f, m_lo, avl);
+        __riscv_vse32_v_f32m2(y + i, out, avl);
+    }
+    return;
+#endif
     uint16_t t;
-    for (int i = 0; i < n; ++i) {
+    for (; i < n; ++i) {
         if (x[i] <= -10.0f) {
             y[i] = 0.0f;
         } else if (x[i] >= 10.0f) {
@@ -1165,8 +1189,22 @@ inline static float ggml_gelu_quick_f32(float x) {
 
 #ifdef GGML_GELU_QUICK_FP16
 inline static void ggml_vec_gelu_quick_f32(const int n, float * y, const float * x) {
+    int i = 0;
+#if defined(__riscv_v_intrinsic) && defined(__riscv_zvfh)
+    for (int avl; i < n; i += avl) {
+        avl = __riscv_vsetvl_e32m2(n - i);
+        vfloat32m2_t vx  = __riscv_vle32_v_f32m2(x + i, avl);
+        vfloat16m1_t vxh = __riscv_vfncvt_f_f_w_f16m1(vx, avl);
+        vuint16m1_t  idx = __riscv_vreinterpret_v_f16m1_u16m1(vxh);
+        vuint32m2_t  off = __riscv_vsll_vx_u32m2(__riscv_vzext_vf2_u32m2(idx, avl), 1, avl);
+        vuint16m1_t  lv  = __riscv_vloxei32_v_u16m1((const uint16_t *)ggml_table_gelu_quick_f16, off, avl);
+        vfloat16m1_t lh  = __riscv_vreinterpret_v_u16m1_f16m1(lv);
+        __riscv_vse32_v_f32m2(y + i, __riscv_vfwcvt_f_f_v_f32m2(lh, avl), avl);
+    }
+    return;
+#endif
     uint16_t t;
-    for (int i = 0; i < n; ++i) {
+    for (; i < n; ++i) {
         ggml_fp16_t fp16 = GGML_CPU_FP32_TO_FP16(x[i]);
         memcpy(&t, &fp16, sizeof(uint16_t));
         y[i] = GGML_CPU_FP16_TO_FP32(ggml_table_gelu_quick_f16[t]);
