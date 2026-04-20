@@ -1015,7 +1015,26 @@ inline static void ggml_vec_step_f16 (const int n, ggml_fp16_t * y, const ggml_f
         y[i] = GGML_CPU_FP32_TO_FP16((GGML_CPU_FP16_TO_FP32(x[i]) > 0.f) ? 1.f : 0.f);
     }
 }
-inline static void ggml_vec_tanh_f32 (const int n, float * y, const float * x) { for (int i = 0; i < n; ++i) y[i] = tanhf(x[i]);  }
+inline static void ggml_vec_tanh_f32 (const int n, float * y, const float * x) {
+    int i = 0;
+#if defined(__riscv_v_intrinsic)
+    // tanh(x) = 1 - 2 / (1 + exp(2x))  (for x in [~-10, ~10], clamp outside).
+    // Accuracy ~ that of ggml_v_expf_m2; adequate for activation use.
+    for (int avl; i < n; i += avl) {
+        avl = __riscv_vsetvl_e32m2(n - i);
+        vfloat32m2_t vx   = __riscv_vle32_v_f32m2(x + i, avl);
+        // clamp into [-10, 10] to avoid exp overflow (tanh saturates anyway)
+        vfloat32m2_t cx   = __riscv_vfmin_vf_f32m2(__riscv_vfmax_vf_f32m2(vx, -10.0f, avl), 10.0f, avl);
+        vfloat32m2_t two_x = __riscv_vfmul_vf_f32m2(cx, 2.0f, avl);
+        vfloat32m2_t e     = ggml_v_expf_m2(two_x, avl);
+        vfloat32m2_t one_p = __riscv_vfadd_vf_f32m2(e, 1.0f, avl);
+        vfloat32m2_t two_over = __riscv_vfrdiv_vf_f32m2(one_p, 2.0f, avl);   // 2 / (1+e^(2x))
+        __riscv_vse32_v_f32m2(y + i, __riscv_vfrsub_vf_f32m2(two_over, 1.0f, avl), avl); // 1 - ...
+    }
+    return;
+#endif
+    for (; i < n; ++i) y[i] = tanhf(x[i]);
+}
 inline static void ggml_vec_tanh_f16 (const int n, ggml_fp16_t * y, const ggml_fp16_t * x) {
     for (int i = 0; i < n; ++i) {
         y[i] = GGML_CPU_FP32_TO_FP16(tanhf(GGML_CPU_FP16_TO_FP32(x[i])));
