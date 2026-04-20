@@ -1527,14 +1527,25 @@ inline static void ggml_vec_geglu_quick_f16(const int n, ggml_fp16_t * y, const 
 }
 
 inline static void ggml_vec_sum_f32(const int n, float * s, const float * x) {
-#ifndef GGML_USE_ACCELERATE
+#if defined(GGML_USE_ACCELERATE)
+    vDSP_sve(x, 1, s, n);
+#elif defined(__riscv_v_intrinsic)
+    // Widening reduction to f64 preserves precision for long sums
+    // (matches the ggml_float accumulator in the scalar path).
+    vfloat64m1_t vsum = __riscv_vfmv_v_f_f64m1(0.0, 1);
+    int i = 0;
+    for (int avl; i < n; i += avl) {
+        avl = __riscv_vsetvl_e32m2(n - i);
+        vfloat32m2_t v = __riscv_vle32_v_f32m2(x + i, avl);
+        vsum = __riscv_vfwredusum_vs_f32m2_f64m1(v, vsum, avl);
+    }
+    *s = (float)__riscv_vfmv_f_s_f64m1_f64(vsum);
+#else
     ggml_float sum = 0.0;
     for (int i = 0; i < n; ++i) {
         sum += (ggml_float)x[i];
     }
     *s = (float)sum;
-#else
-    vDSP_sve(x, 1, s, n);
 #endif
 }
 
