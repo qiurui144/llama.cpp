@@ -25,6 +25,12 @@ typedef double ggml_float;
 extern "C" {
 #endif
 
+#if defined(__riscv_v_intrinsic)
+// Forward declaration for RVV helpers used by some vec_* implementations
+// before the helpers themselves are defined later in this header.
+static inline vfloat32m2_t ggml_v_expf_m2(vfloat32m2_t x, int vl);
+#endif
+
 //
 // global data
 //
@@ -1168,9 +1174,23 @@ inline static void ggml_vec_gelu_quick_f32(const int n, float * y, const float *
 }
 #else
 inline static void ggml_vec_gelu_quick_f32(const int n, float * y, const float * x) {
-    for (int i = 0; i < n; ++i) {
+    int i = 0;
+#if defined(__riscv_v_intrinsic)
+    // gelu_quick(x) = x * sigmoid(-GELU_QUICK_COEF * x) = x / (1 + exp(GELU_QUICK_COEF * x))
+    // Note GELU_QUICK_COEF is negative (-1.702f), so expf(COEF*x) is the sigmoid denom shape.
+    for (int avl; i < n; i += avl) {
+        avl = __riscv_vsetvl_e32m2(n - i);
+        vfloat32m2_t vx    = __riscv_vle32_v_f32m2(x + i, avl);
+        vfloat32m2_t arg   = __riscv_vfmul_vf_f32m2(vx, GELU_QUICK_COEF, avl);
+        vfloat32m2_t e     = ggml_v_expf_m2(arg, avl);
+        vfloat32m2_t denom = __riscv_vfadd_vf_f32m2(e, 1.0f, avl);
+        __riscv_vse32_v_f32m2(y + i, __riscv_vfdiv_vv_f32m2(vx, denom, avl), avl);
+    }
+#else
+    for (; i < n; ++i) {
         y[i] = ggml_gelu_quick_f32(x[i]);
     }
+#endif
 }
 #endif
 
