@@ -81,6 +81,9 @@ uint64_t ggml_graph_next_uid(void) {
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#ifdef __linux__
+#include <sys/mman.h>
+#endif
 #if defined(__linux__)
 #include <sys/prctl.h>
 #endif
@@ -361,6 +364,19 @@ void * ggml_aligned_malloc(size_t size) {
   #else
     int result = posix_memalign(&aligned_memory, alignment, size);
   #endif
+#ifdef __linux__
+    // Hint kernel to back large tensor buffers with transparent hugepages.
+    // Reduces TLB pressure for model weights (e.g., 600 MB tensor → 300 × 2 MB pages
+    // instead of 150K × 4 KB pages). Alignment to 2 MB is not required; kernel will
+    // silently promote any sub-range that happens to be 2 MB aligned.
+    if (result == 0 && aligned_memory && size >= 2 * 1024 * 1024) {
+        uintptr_t a = ((uintptr_t)aligned_memory + 4095) & ~(uintptr_t)4095;
+        size_t    off = a - (uintptr_t)aligned_memory;
+        if (size > off + 4096) {
+            (void)madvise((void *)a, size - off, MADV_HUGEPAGE);
+        }
+    }
+#endif
     if (result != 0) {
         // Handle allocation failure
         const char *error_desc = "unknown allocation error";
