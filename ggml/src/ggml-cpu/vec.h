@@ -96,9 +96,38 @@ inline static void ggml_vec_add_f16 (const int n, ggml_fp16_t * z, const ggml_fp
         z[i] = GGML_CPU_FP32_TO_FP16(GGML_CPU_FP16_TO_FP32(x[i]) + GGML_CPU_FP16_TO_FP32(y[i]));
     }
 }
-inline static void ggml_vec_add1_f32(const int n, float * z, const float * x, const float   v) { for (int i = 0; i < n; ++i) z[i]  = x[i] + v;    }
-inline static void ggml_vec_acc_f32 (const int n, float * y, const float * x)                  { for (int i = 0; i < n; ++i) y[i] += x[i];        }
-inline static void ggml_vec_acc1_f32(const int n, float * y, const float   v)                  { for (int i = 0; i < n; ++i) y[i] += v;           }
+inline static void ggml_vec_add1_f32(const int n, float * z, const float * x, const float   v) {
+#if defined(__riscv_v_intrinsic)
+    for (int i = 0, avl; i < n; i += avl) {
+        avl = __riscv_vsetvl_e32m4(n - i);
+        __riscv_vse32_v_f32m4(z + i, __riscv_vfadd_vf_f32m4(__riscv_vle32_v_f32m4(x + i, avl), v, avl), avl);
+    }
+#else
+    for (int i = 0; i < n; ++i) z[i] = x[i] + v;
+#endif
+}
+inline static void ggml_vec_acc_f32 (const int n, float * y, const float * x) {
+#if defined(__riscv_v_intrinsic)
+    for (int i = 0, avl; i < n; i += avl) {
+        avl = __riscv_vsetvl_e32m4(n - i);
+        vfloat32m4_t vy = __riscv_vle32_v_f32m4(y + i, avl);
+        vfloat32m4_t vx = __riscv_vle32_v_f32m4(x + i, avl);
+        __riscv_vse32_v_f32m4(y + i, __riscv_vfadd_vv_f32m4(vy, vx, avl), avl);
+    }
+#else
+    for (int i = 0; i < n; ++i) y[i] += x[i];
+#endif
+}
+inline static void ggml_vec_acc1_f32(const int n, float * y, const float   v) {
+#if defined(__riscv_v_intrinsic)
+    for (int i = 0, avl; i < n; i += avl) {
+        avl = __riscv_vsetvl_e32m4(n - i);
+        __riscv_vse32_v_f32m4(y + i, __riscv_vfadd_vf_f32m4(__riscv_vle32_v_f32m4(y + i, avl), v, avl), avl);
+    }
+#else
+    for (int i = 0; i < n; ++i) y[i] += v;
+#endif
+}
 inline static void ggml_vec_sub_f32 (const int n, float * z, const float * x, const float * y) {
 #if defined(__riscv_v_intrinsic)
     for (int i = 0, avl; i < n; i += avl) {
@@ -116,8 +145,26 @@ inline static void ggml_vec_sub_f16 (const int n, ggml_fp16_t * z, const ggml_fp
         z[i] = GGML_CPU_FP32_TO_FP16(GGML_CPU_FP16_TO_FP32(x[i]) - GGML_CPU_FP16_TO_FP32(y[i]));
     }
 }
-inline static void ggml_vec_set_f32 (const int n, float * x, const float   v)                  { for (int i = 0; i < n; ++i) x[i]  = v;           }
-inline static void ggml_vec_cpy_f32 (const int n, float * y, const float * x)                  { for (int i = 0; i < n; ++i) y[i]  = x[i];        }
+inline static void ggml_vec_set_f32 (const int n, float * x, const float   v) {
+#if defined(__riscv_v_intrinsic)
+    for (int i = 0, avl; i < n; i += avl) {
+        avl = __riscv_vsetvl_e32m4(n - i);
+        __riscv_vse32_v_f32m4(x + i, __riscv_vfmv_v_f_f32m4(v, avl), avl);
+    }
+#else
+    for (int i = 0; i < n; ++i) x[i] = v;
+#endif
+}
+inline static void ggml_vec_cpy_f32 (const int n, float * y, const float * x) {
+#if defined(__riscv_v_intrinsic)
+    for (int i = 0, avl; i < n; i += avl) {
+        avl = __riscv_vsetvl_e32m4(n - i);
+        __riscv_vse32_v_f32m4(y + i, __riscv_vle32_v_f32m4(x + i, avl), avl);
+    }
+#else
+    for (int i = 0; i < n; ++i) y[i] = x[i];
+#endif
+}
 inline static void ggml_vec_neg_f32 (const int n, float * y, const float * x) {
 #if defined(__riscv_v_intrinsic)
     for (int i = 0, avl; i < n; i += avl) {
