@@ -620,6 +620,19 @@ ggml_float ggml_vec_log_soft_max_f32(const int n, float * y, const float * x, fl
 
     int i = 0;
     ggml_float sum = 0;
+#if defined(__riscv_v_intrinsic)
+    // Same shape as ggml_vec_soft_max_f32 but stores y[i] = (x[i] - max)
+    // and accumulates sum of exp(x[i] - max). Final log() is scalar.
+    vfloat64m1_t vsum = __riscv_vfmv_v_f_f64m1(0.0, 1);
+    for (int avl; i < n; i += avl) {
+        avl = __riscv_vsetvl_e32m2(n - i);
+        vfloat32m2_t shifted = __riscv_vfsub_vf_f32m2(__riscv_vle32_v_f32m2(&x[i], avl), max, avl);
+        __riscv_vse32_v_f32m2(&y[i], shifted, avl);
+        vfloat32m2_t e = ggml_v_expf_m2(shifted, avl);
+        vsum = __riscv_vfwredusum_vs_f32m2_f64m1(e, vsum, avl);
+    }
+    sum = __riscv_vfmv_f_s_f64m1_f64(vsum);
+#endif
     for (; i < n; ++i) {
         float val = x[i] - max;
         y[i] = val;
