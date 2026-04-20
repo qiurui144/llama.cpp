@@ -30,6 +30,8 @@ extern "C" {
 // before the helpers themselves are defined later in this header.
 static inline vfloat32m2_t ggml_v_expf_m2(vfloat32m2_t x, int vl);
 static inline vfloat32m2_t ggml_v_logf_m2(vfloat32m2_t x, int vl);
+static inline vfloat32m2_t ggml_v_sinf_m2(vfloat32m2_t x, int vl);
+static inline vfloat32m2_t ggml_v_cosf_m2(vfloat32m2_t x, int vl);
 #endif
 
 //
@@ -982,13 +984,33 @@ inline static void ggml_vec_log_f16 (const int n, ggml_fp16_t * y, const ggml_fp
         y[i] = GGML_CPU_FP32_TO_FP16(logf(GGML_CPU_FP16_TO_FP32(x[i])));
     }
 }
-inline static void ggml_vec_sin_f32  (const int n, float * y, const float * x) { for (int i = 0; i < n; ++i) y[i] = sinf(x[i]);  }
+inline static void ggml_vec_sin_f32  (const int n, float * y, const float * x) {
+#if defined(__riscv_v_intrinsic)
+    for (int i = 0, avl; i < n; i += avl) {
+        avl = __riscv_vsetvl_e32m2(n - i);
+        vfloat32m2_t vx = __riscv_vle32_v_f32m2(x + i, avl);
+        __riscv_vse32_v_f32m2(y + i, ggml_v_sinf_m2(vx, avl), avl);
+    }
+#else
+    for (int i = 0; i < n; ++i) y[i] = sinf(x[i]);
+#endif
+}
 inline static void ggml_vec_sin_f16 (const int n, ggml_fp16_t * y, const ggml_fp16_t * x) {
     for (int i = 0; i < n; ++i) {
         y[i] = GGML_CPU_FP32_TO_FP16(sinf(GGML_CPU_FP16_TO_FP32(x[i])));
     }
 }
-inline static void ggml_vec_cos_f32  (const int n, float * y, const float * x) { for (int i = 0; i < n; ++i) y[i] = cosf(x[i]);  }
+inline static void ggml_vec_cos_f32  (const int n, float * y, const float * x) {
+#if defined(__riscv_v_intrinsic)
+    for (int i = 0, avl; i < n; i += avl) {
+        avl = __riscv_vsetvl_e32m2(n - i);
+        vfloat32m2_t vx = __riscv_vle32_v_f32m2(x + i, avl);
+        __riscv_vse32_v_f32m2(y + i, ggml_v_cosf_m2(vx, avl), avl);
+    }
+#else
+    for (int i = 0; i < n; ++i) y[i] = cosf(x[i]);
+#endif
+}
 inline static void ggml_vec_cos_f16 (const int n, ggml_fp16_t * y, const ggml_fp16_t * x) {
     for (int i = 0; i < n; ++i) {
         y[i] = GGML_CPU_FP32_TO_FP16(cosf(GGML_CPU_FP16_TO_FP32(x[i])));
@@ -1647,6 +1669,48 @@ inline static vfloat32m2_t ggml_v_logf_m2(vfloat32m2_t x, int vl) {
     // final: log(x) = e*ln(2) + logm
     vfloat32m2_t ef = __riscv_vfcvt_f_x_v_f32m2(exp, vl);
     return __riscv_vfmadd_vf_f32m2(ef, 0.6931471806f, logm, vl);
+}
+
+// sin/cos via Cody-Waite-style argument reduction to [-π/4, π/4] and
+// 6-term Horner polynomials. Accuracy ~1 ULP for |x| <= 2^23; beyond
+// that point range-reduction error dominates (same limitation as
+// many vector libm implementations without extended-precision pi).
+inline static vfloat32m2_t ggml_v_sinf_m2(vfloat32m2_t x, int vl) {
+    // k = nearbyint(x * (2/π))
+    vfloat32m2_t k_f = __riscv_vfmul_vf_f32m2(x, 0.6366197723675814f, vl);  // 2/π
+    vint32m2_t   k_i = __riscv_vfcvt_x_f_v_i32m2(k_f, vl);                   // round-to-nearest
+    k_f = __riscv_vfcvt_f_x_v_f32m2(k_i, vl);
+    // y = x - k * π/2  (Cody-Waite, two-part constant)
+    vfloat32m2_t y = __riscv_vfnmsac_vf_f32m2(x, 1.5707963705062866f, k_f, vl);   // π/2 hi
+    y = __riscv_vfnmsac_vf_f32m2(y, -4.3711388286737929e-08f, k_f, vl);            // π/2 lo
+    // quadrant bits
+    vuint32m2_t q = __riscv_vreinterpret_v_i32m2_u32m2(k_i);
+    vbool16_t use_cos = __riscv_vmseq_vx_u32m2_b16(__riscv_vand_vx_u32m2(q, 1u, vl), 1u, vl);
+    vbool16_t neg     = __riscv_vmseq_vx_u32m2_b16(__riscv_vand_vx_u32m2(q, 2u, vl), 2u, vl);
+    // sin(y) ~ y * (1 + y²*(-1/6 + y²*(1/120 + y²*(-1/5040 + y²/362880))))
+    // cos(y) ~ 1 + y²*(-1/2 + y²*(1/24 + y²*(-1/720 + y²/40320)))
+    vfloat32m2_t y2 = __riscv_vfmul_vv_f32m2(y, y, vl);
+    // sin
+    vfloat32m2_t s = __riscv_vfmadd_vf_f32m2(y2,  2.7557319e-06f, __riscv_vfmv_v_f_f32m2(-1.984127e-04f, vl), vl);
+    s = __riscv_vfmadd_vv_f32m2(y2, s, __riscv_vfmv_v_f_f32m2( 8.3333333e-03f, vl), vl);
+    s = __riscv_vfmadd_vv_f32m2(y2, s, __riscv_vfmv_v_f_f32m2(-1.6666667e-01f, vl), vl);
+    s = __riscv_vfmadd_vv_f32m2(y2, s, __riscv_vfmv_v_f_f32m2( 1.0f,           vl), vl);
+    s = __riscv_vfmul_vv_f32m2(y, s, vl);
+    // cos
+    vfloat32m2_t c = __riscv_vfmadd_vf_f32m2(y2, -2.7557319e-07f, __riscv_vfmv_v_f_f32m2( 2.4801587e-05f, vl), vl);
+    c = __riscv_vfmadd_vv_f32m2(y2, c, __riscv_vfmv_v_f_f32m2(-1.3888889e-03f, vl), vl);
+    c = __riscv_vfmadd_vv_f32m2(y2, c, __riscv_vfmv_v_f_f32m2( 4.1666667e-02f, vl), vl);
+    c = __riscv_vfmadd_vv_f32m2(y2, c, __riscv_vfmv_v_f_f32m2(-5.0000000e-01f, vl), vl);
+    c = __riscv_vfmadd_vv_f32m2(y2, c, __riscv_vfmv_v_f_f32m2( 1.0f,           vl), vl);
+    // pick sin(y) or cos(y) by quadrant bit 0
+    vfloat32m2_t r = __riscv_vmerge_vvm_f32m2(s, c, use_cos, vl);
+    // flip sign where quadrant bit 1 says
+    return __riscv_vfneg_v_f32m2_mu(neg, r, r, vl);
+}
+
+inline static vfloat32m2_t ggml_v_cosf_m2(vfloat32m2_t x, int vl) {
+    // cos(x) = sin(x + π/2)
+    return ggml_v_sinf_m2(__riscv_vfadd_vf_f32m2(x, 1.5707963267948966f, vl), vl);
 }
 
 #endif // __ARM_NEON / __AVX2__ / __SSE2__ / __riscv_v_intrinsic
