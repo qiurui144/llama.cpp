@@ -1564,14 +1564,26 @@ inline static void ggml_vec_sum_bf16_ggf(const int n, float * s, const ggml_bf16
 }
 
 inline static void ggml_vec_max_f32(const int n, float * s, const float * x) {
-#ifndef GGML_USE_ACCELERATE
+#if defined(GGML_USE_ACCELERATE)
+    vDSP_maxv(x, 1, s, n);
+#elif defined(__riscv_v_intrinsic)
+    // RVV vector reduction: vfredmax over LMUL=2 chunks with VLEN-agnostic loop.
+    // Hot in flash_attn_ext_tiled (per-row tile-max) and softmax pre-pass.
+    const float neg_inf = -INFINITY;
+    vfloat32m1_t vmax = __riscv_vfmv_v_f_f32m1(neg_inf, 1);
+    int i = 0;
+    for (int avl; i < n; i += avl) {
+        avl = __riscv_vsetvl_e32m2(n - i);
+        vfloat32m2_t v = __riscv_vle32_v_f32m2(&x[i], avl);
+        vmax = __riscv_vfredmax_vs_f32m2_f32m1(v, vmax, avl);
+    }
+    *s = __riscv_vfmv_f_s_f32m1_f32(vmax);
+#else
     float max = -INFINITY;
     for (int i = 0; i < n; ++i) {
         max = MAX(max, x[i]);
     }
     *s = max;
-#else
-    vDSP_maxv(x, 1, s, n);
 #endif
 }
 
