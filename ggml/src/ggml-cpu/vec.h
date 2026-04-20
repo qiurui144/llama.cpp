@@ -66,6 +66,15 @@ inline static void ggml_vec_add_f32 (const int n, float * z, const float * x, co
         __m256 vz = _mm256_add_ps(vx, vy);
         _mm256_storeu_ps(z + i, vz);
     }
+#elif defined(__riscv_v_intrinsic)
+    // Hot in flash_attn_ext_tiled (KQ += mask per KV tile) and general tensor add.
+    for (int avl; i < n; i += avl) {
+        avl = __riscv_vsetvl_e32m4(n - i);
+        vfloat32m4_t vx = __riscv_vle32_v_f32m4(x + i, avl);
+        vfloat32m4_t vy = __riscv_vle32_v_f32m4(y + i, avl);
+        __riscv_vse32_v_f32m4(z + i, __riscv_vfadd_vv_f32m4(vx, vy, avl), avl);
+    }
+    return;
 #endif
     for (; i < n; ++i) {
         z[i] = x[i] + y[i];
