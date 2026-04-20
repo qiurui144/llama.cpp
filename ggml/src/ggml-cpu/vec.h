@@ -92,9 +92,18 @@ inline static void ggml_vec_add_f32 (const int n, float * z, const float * x, co
 }
 
 inline static void ggml_vec_add_f16 (const int n, ggml_fp16_t * z, const ggml_fp16_t * x, const ggml_fp16_t * y) {
+#if defined(__riscv_v_intrinsic) && defined(__riscv_zvfh)
+    for (int i = 0, avl; i < n; i += avl) {
+        avl = __riscv_vsetvl_e16m4(n - i);
+        vfloat16m4_t vx = __riscv_vle16_v_f16m4((const _Float16 *)(x + i), avl);
+        vfloat16m4_t vy = __riscv_vle16_v_f16m4((const _Float16 *)(y + i), avl);
+        __riscv_vse16_v_f16m4((_Float16 *)(z + i), __riscv_vfadd_vv_f16m4(vx, vy, avl), avl);
+    }
+#else
     for (int i = 0; i < n; ++i) {
         z[i] = GGML_CPU_FP32_TO_FP16(GGML_CPU_FP16_TO_FP32(x[i]) + GGML_CPU_FP16_TO_FP32(y[i]));
     }
+#endif
 }
 inline static void ggml_vec_add1_f32(const int n, float * z, const float * x, const float   v) {
 #if defined(__riscv_v_intrinsic)
@@ -141,9 +150,18 @@ inline static void ggml_vec_sub_f32 (const int n, float * z, const float * x, co
 #endif
 }
 inline static void ggml_vec_sub_f16 (const int n, ggml_fp16_t * z, const ggml_fp16_t * x, const ggml_fp16_t * y) {
+#if defined(__riscv_v_intrinsic) && defined(__riscv_zvfh)
+    for (int i = 0, avl; i < n; i += avl) {
+        avl = __riscv_vsetvl_e16m4(n - i);
+        vfloat16m4_t vx = __riscv_vle16_v_f16m4((const _Float16 *)(x + i), avl);
+        vfloat16m4_t vy = __riscv_vle16_v_f16m4((const _Float16 *)(y + i), avl);
+        __riscv_vse16_v_f16m4((_Float16 *)(z + i), __riscv_vfsub_vv_f16m4(vx, vy, avl), avl);
+    }
+#else
     for (int i = 0; i < n; ++i) {
         z[i] = GGML_CPU_FP32_TO_FP16(GGML_CPU_FP16_TO_FP32(x[i]) - GGML_CPU_FP16_TO_FP32(y[i]));
     }
+#endif
 }
 inline static void ggml_vec_set_f32 (const int n, float * x, const float   v) {
 #if defined(__riscv_v_intrinsic)
@@ -177,9 +195,17 @@ inline static void ggml_vec_neg_f32 (const int n, float * y, const float * x) {
 #endif
 }
 inline static void ggml_vec_neg_f16 (const int n, ggml_fp16_t * y, const ggml_fp16_t * x) {
+#if defined(__riscv_v_intrinsic) && defined(__riscv_zvfh)
+    for (int i = 0, avl; i < n; i += avl) {
+        avl = __riscv_vsetvl_e16m4(n - i);
+        vfloat16m4_t vx = __riscv_vle16_v_f16m4((const _Float16 *)(x + i), avl);
+        __riscv_vse16_v_f16m4((_Float16 *)(y + i), __riscv_vfneg_v_f16m4(vx, avl), avl);
+    }
+#else
     for (int i = 0; i < n; ++i) {
         y[i] = GGML_CPU_FP32_TO_FP16(-GGML_CPU_FP16_TO_FP32(x[i]));
     }
+#endif
 }
 
 inline static void ggml_vec_mul_f32 (const int n, float * z, const float * x, const float * y) {
@@ -195,9 +221,18 @@ inline static void ggml_vec_mul_f32 (const int n, float * z, const float * x, co
 #endif
 }
 inline static void ggml_vec_mul_f16 (const int n, ggml_fp16_t * z, const ggml_fp16_t * x, const ggml_fp16_t * y) {
+#if defined(__riscv_v_intrinsic) && defined(__riscv_zvfh)
+    for (int i = 0, avl; i < n; i += avl) {
+        avl = __riscv_vsetvl_e16m4(n - i);
+        vfloat16m4_t vx = __riscv_vle16_v_f16m4((const _Float16 *)(x + i), avl);
+        vfloat16m4_t vy = __riscv_vle16_v_f16m4((const _Float16 *)(y + i), avl);
+        __riscv_vse16_v_f16m4((_Float16 *)(z + i), __riscv_vfmul_vv_f16m4(vx, vy, avl), avl);
+    }
+#else
     for (int i = 0; i < n; ++i) {
         z[i] = GGML_CPU_FP32_TO_FP16(GGML_CPU_FP16_TO_FP32(x[i]) * GGML_CPU_FP16_TO_FP32(y[i]));
     }
+#endif
 }
 inline static void ggml_vec_div_f32 (const int n, float * z, const float * x, const float * y) {
 #if defined(__riscv_v_intrinsic)
@@ -212,9 +247,18 @@ inline static void ggml_vec_div_f32 (const int n, float * z, const float * x, co
 #endif
 }
 inline static void ggml_vec_div_f16 (const int n, ggml_fp16_t * z, const ggml_fp16_t * x, const ggml_fp16_t * y) {
+#if defined(__riscv_v_intrinsic) && defined(__riscv_zvfh)
+    for (int i = 0, avl; i < n; i += avl) {
+        avl = __riscv_vsetvl_e16m4(n - i);
+        vfloat16m4_t vx = __riscv_vle16_v_f16m4((const _Float16 *)(x + i), avl);
+        vfloat16m4_t vy = __riscv_vle16_v_f16m4((const _Float16 *)(y + i), avl);
+        __riscv_vse16_v_f16m4((_Float16 *)(z + i), __riscv_vfdiv_vv_f16m4(vx, vy, avl), avl);
+    }
+#else
     for (int i = 0; i < n; ++i) {
         z[i] = GGML_CPU_FP32_TO_FP16(GGML_CPU_FP16_TO_FP32(x[i]) / GGML_CPU_FP16_TO_FP32(y[i]));
     }
+#endif
 }
 
 // compute GGML_VEC_DOT_UNROLL dot products at once
@@ -995,10 +1039,18 @@ inline static void ggml_vec_sqr_f32  (const int n, float * y, const float * x) {
 #endif
 }
 inline static void ggml_vec_sqr_f16 (const int n, ggml_fp16_t * y, const ggml_fp16_t * x) {
+#if defined(__riscv_v_intrinsic) && defined(__riscv_zvfh)
+    for (int i = 0, avl; i < n; i += avl) {
+        avl = __riscv_vsetvl_e16m4(n - i);
+        vfloat16m4_t vx = __riscv_vle16_v_f16m4((const _Float16 *)(x + i), avl);
+        __riscv_vse16_v_f16m4((_Float16 *)(y + i), __riscv_vfmul_vv_f16m4(vx, vx, avl), avl);
+    }
+#else
     for (int i = 0; i < n; ++i) {
         float v = GGML_CPU_FP16_TO_FP32(x[i]);
         y[i] = GGML_CPU_FP32_TO_FP16(v*v);
     }
+#endif
 }
 inline static void ggml_vec_sqrt_f32 (const int n, float * y, const float * x) {
 #if defined(__riscv_v_intrinsic)
@@ -1076,9 +1128,17 @@ inline static void ggml_vec_abs_f32  (const int n, float * y, const float * x) {
 #endif
 }
 inline static void ggml_vec_abs_f16 (const int n, ggml_fp16_t * y, const ggml_fp16_t * x) {
+#if defined(__riscv_v_intrinsic) && defined(__riscv_zvfh)
+    for (int i = 0, avl; i < n; i += avl) {
+        avl = __riscv_vsetvl_e16m4(n - i);
+        vfloat16m4_t vx = __riscv_vle16_v_f16m4((const _Float16 *)(x + i), avl);
+        __riscv_vse16_v_f16m4((_Float16 *)(y + i), __riscv_vfabs_v_f16m4(vx, avl), avl);
+    }
+#else
     for (int i = 0; i < n; ++i) {
         y[i] = GGML_CPU_FP32_TO_FP16(fabsf(GGML_CPU_FP16_TO_FP32(x[i])));
     }
+#endif
 }
 inline static void ggml_vec_sgn_f32  (const int n, float * y, const float * x) {
 #if defined(__riscv_v_intrinsic)
