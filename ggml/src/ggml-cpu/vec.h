@@ -1042,7 +1042,23 @@ inline static void ggml_vec_relu_f16 (const int n, ggml_fp16_t * y, const ggml_f
         y[i] = GGML_CPU_FP32_TO_FP16((v > 0.f) ? v : 0.f);
     }
 }
-inline static void ggml_vec_leaky_relu_f32 (const int n, float * y, const float * x, const float ns) { for (int i = 0; i < n; ++i) y[i] = ((x[i] > 0.f) ? x[i] : 0.f) + ns * ((x[i] < 0.0f) ? x[i] : 0.f); }
+inline static void ggml_vec_leaky_relu_f32 (const int n, float * y, const float * x, const float ns) {
+#if defined(__riscv_v_intrinsic)
+    // y = max(x, 0) + ns * min(x, 0) — equivalent to the scalar branch:
+    //   (x > 0) ? x : 0 + ns * ((x < 0) ? x : 0)
+    // (for x == 0 both branches contribute 0; no special-case needed)
+    for (int i = 0, avl; i < n; i += avl) {
+        avl = __riscv_vsetvl_e32m4(n - i);
+        vfloat32m4_t vx  = __riscv_vle32_v_f32m4(x + i, avl);
+        vfloat32m4_t pos = __riscv_vfmax_vf_f32m4(vx, 0.0f, avl);
+        vfloat32m4_t neg = __riscv_vfmin_vf_f32m4(vx, 0.0f, avl);
+        vfloat32m4_t out = __riscv_vfmacc_vf_f32m4(pos, ns, neg, avl);
+        __riscv_vse32_v_f32m4(y + i, out, avl);
+    }
+#else
+    for (int i = 0; i < n; ++i) y[i] = ((x[i] > 0.f) ? x[i] : 0.f) + ns * ((x[i] < 0.0f) ? x[i] : 0.f);
+#endif
+}
 inline static void ggml_vec_leaky_relu_f16 (const int n, ggml_fp16_t * y, const ggml_fp16_t * x, const float ns) {
     for (int i = 0; i < n; ++i) {
         float v = GGML_CPU_FP16_TO_FP32(x[i]);
