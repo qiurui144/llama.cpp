@@ -2006,6 +2006,25 @@ inline static void ggml_vec_sum_f32(const int n, float * s, const float * x) {
 }
 
 inline static void ggml_vec_cumsum_f32(const int n, float * y, const float * x) {
+#if defined(__riscv_v_intrinsic)
+    // Per-chunk inclusive prefix sum via Hillis-Steele, carried across chunks
+    // by a scalar running accumulator. LMUL=1 so vslideup is single-register.
+    float running = 0.0f;
+    for (int i = 0, avl; i < n; i += avl) {
+        avl = __riscv_vsetvl_e32m1(n - i);
+        vfloat32m1_t v   = __riscv_vle32_v_f32m1(x + i, avl);
+        vuint32m1_t  idx = __riscv_vid_v_u32m1(avl);
+        for (int k = 1; k < avl; k *= 2) {
+            vfloat32m1_t s     = __riscv_vslideup_vx_f32m1(v, v, k, avl);
+            vbool32_t    m_add = __riscv_vmsgeu_vx_u32m1_b32(idx, (uint32_t)k, avl);
+            v = __riscv_vfadd_vv_f32m1_mu(m_add, v, v, s, avl);
+        }
+        v = __riscv_vfadd_vf_f32m1(v, running, avl);
+        __riscv_vse32_v_f32m1(y + i, v, avl);
+        // last-element of v becomes the carry for the next chunk
+        running = __riscv_vfmv_f_s_f32m1_f32(__riscv_vslidedown_vx_f32m1(v, avl - 1, avl));
+    }
+#else
     for (int i = 0; i < n; ++i) {
         if (i == 0) {
             y[i] = x[i];
@@ -2013,29 +2032,57 @@ inline static void ggml_vec_cumsum_f32(const int n, float * y, const float * x) 
             y[i] = y[i - 1] + x[i];
         }
     }
+#endif
 }
 
 inline static void ggml_vec_sum_f32_ggf(const int n, ggml_float * s, const float * x) {
     ggml_float sum = 0.0;
-    for (int i = 0; i < n; ++i) {
-        sum += (ggml_float)x[i];
+#if defined(__riscv_v_intrinsic)
+    vfloat64m1_t vs = __riscv_vfmv_v_f_f64m1(0.0, 1);
+    for (int i = 0, avl; i < n; i += avl) {
+        avl = __riscv_vsetvl_e32m2(n - i);
+        vs = __riscv_vfwredusum_vs_f32m2_f64m1(__riscv_vle32_v_f32m2(x + i, avl), vs, avl);
     }
+    sum = __riscv_vfmv_f_s_f64m1_f64(vs);
+#else
+    for (int i = 0; i < n; ++i) sum += (ggml_float)x[i];
+#endif
     *s = sum;
 }
 
 inline static void ggml_vec_sum_f16_ggf(const int n, float * s, const ggml_fp16_t * x) {
     float sum = 0.0f;
-    for (int i = 0; i < n; ++i) {
-        sum += GGML_CPU_FP16_TO_FP32(x[i]);
+#if defined(__riscv_v_intrinsic) && defined(__riscv_zvfh)
+    vfloat32m1_t vs = __riscv_vfmv_v_f_f32m1(0.0f, 1);
+    for (int i = 0, avl; i < n; i += avl) {
+        avl = __riscv_vsetvl_e16m1(n - i);
+        vfloat16m1_t vh = __riscv_vle16_v_f16m1((const _Float16 *)(x + i), avl);
+        vs = __riscv_vfwredusum_vs_f16m1_f32m1(vh, vs, avl);
     }
+    sum = __riscv_vfmv_f_s_f32m1_f32(vs);
+#else
+    for (int i = 0; i < n; ++i) sum += GGML_CPU_FP16_TO_FP32(x[i]);
+#endif
     *s = sum;
 }
 
 inline static void ggml_vec_sum_bf16_ggf(const int n, float * s, const ggml_bf16_t * x) {
     float sum = 0.0f;
-    for (int i = 0; i < n; ++i) {
-        sum += GGML_BF16_TO_FP32(x[i]);
+#if defined(__riscv_v_intrinsic)
+    // BF16 -> F32 via left-shift 16 of the u16 bits, then reduce.
+    // No Zvfbfmin dependency; works on plain RVV.
+    vfloat32m1_t vs = __riscv_vfmv_v_f_f32m1(0.0f, 1);
+    for (int i = 0, avl; i < n; i += avl) {
+        avl = __riscv_vsetvl_e32m2(n - i);
+        vuint16m1_t bf = __riscv_vle16_v_u16m1((const uint16_t *)(x + i), avl);
+        vuint32m2_t f32_bits = __riscv_vsll_vx_u32m2(__riscv_vzext_vf2_u32m2(bf, avl), 16, avl);
+        vfloat32m2_t f32 = __riscv_vreinterpret_v_u32m2_f32m2(f32_bits);
+        vs = __riscv_vfredusum_vs_f32m2_f32m1(f32, vs, avl);
     }
+    sum = __riscv_vfmv_f_s_f32m1_f32(vs);
+#else
+    for (int i = 0; i < n; ++i) sum += GGML_BF16_TO_FP32(x[i]);
+#endif
     *s = sum;
 }
 
@@ -2069,6 +2116,27 @@ inline static void ggml_vec_norm_inv_f32(const int n, float * s, const float * x
 }
 
 inline static void ggml_vec_argmax_f32(const int n, int * s, const float * x) {
+#if defined(__riscv_v_intrinsic)
+    // 1) full-range vfredmax to find the max value
+    const float neg_inf = -INFINITY;
+    vfloat32m1_t vmax = __riscv_vfmv_v_f_f32m1(neg_inf, 1);
+    for (int i = 0, avl; i < n; i += avl) {
+        avl = __riscv_vsetvl_e32m2(n - i);
+        vfloat32m1_t r = __riscv_vfredmax_vs_f32m2_f32m1(__riscv_vle32_v_f32m2(x + i, avl), vmax, avl);
+        vmax = r;
+    }
+    float max = __riscv_vfmv_f_s_f32m1_f32(vmax);
+    // 2) find the first index with x[i] == max
+    int idx = 0;
+    for (int i = 0, avl; i < n; i += avl) {
+        avl = __riscv_vsetvl_e32m2(n - i);
+        vfloat32m2_t v = __riscv_vle32_v_f32m2(x + i, avl);
+        vbool16_t eq = __riscv_vmfeq_vf_f32m2_b16(v, max, avl);
+        long first = __riscv_vfirst_m_b16(eq, avl);   // -1 if none
+        if (first >= 0) { idx = i + (int)first; break; }
+    }
+    *s = idx;
+#else
     float max = -INFINITY;
     int idx = 0;
     for (int i = 0; i < n; ++i) {
@@ -2076,6 +2144,7 @@ inline static void ggml_vec_argmax_f32(const int n, int * s, const float * x) {
         if (max == x[i]) { idx = i; }
     }
     *s = idx;
+#endif
 }
 
 #ifdef __cplusplus
