@@ -451,6 +451,15 @@ struct llama_mmap::impl {
             throw std::runtime_error(format("mmap failed: %s", strerror(errno)));
         }
 
+#ifdef __linux__
+        // Hint kernel to promote large file mappings to transparent hugepages.
+        // Reduces TLB working set for multi-GB GGUFs (e.g. a 2.3 GB model becomes
+        // ~1150 × 2 MiB pages instead of ~560K × 4 KiB pages).
+        if (file->size() >= 2 * 1024 * 1024) {
+            (void)madvise(addr, file->size(), MADV_HUGEPAGE);
+        }
+#endif
+
         if (prefetch > 0) {
             if (posix_madvise(addr, std::min(file->size(), prefetch), POSIX_MADV_WILLNEED)) {
                 LLAMA_LOG_WARN("warning: posix_madvise(.., POSIX_MADV_WILLNEED) failed: %s\n",
