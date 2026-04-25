@@ -4781,6 +4781,11 @@ class extra_buffer_type : ggml::cpu::extra_buffer_type {
             if (op->src[1]->buffer && !ggml_backend_buft_is_host(op->src[1]->buffer->buft)) {
                 return false;
             }
+            // Repack compute paths assert ne13 == 1; reject src1->ne[3] > 1 here so that
+            // the scheduler picks a different buft instead of aborting at compute time.
+            if (op->src[1]->ne[3] > 1) {
+                return false;
+            }
             if (op->src[1]->type == GGML_TYPE_F32) {
                 return true;
             }
@@ -4795,6 +4800,9 @@ class extra_buffer_type : ggml::cpu::extra_buffer_type {
                 && ggml_repack_get_optimal_repack_type(op->src[0])
                 ) {
             if (op->src[1]->buffer && !ggml_backend_buft_is_host(op->src[1]->buffer->buft)) {
+                return false;
+            }
+            if (op->src[1]->ne[3] > 1) {
                 return false;
             }
             if (op->src[1]->type == GGML_TYPE_F32) {
