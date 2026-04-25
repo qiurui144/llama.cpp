@@ -133,6 +133,57 @@ static void sqnbitgemm_spacemit_ime_i8i4(const size_t                        blk
     }
 }
 
+// Q8_0 (i8 weights) variant of sqnbitgemm_spacemit_ime_i8i4. Mirrors the i4
+// driver but with weight stride accounting for full bytes (no nibble pack)
+// and no zero-point. Routes per-tile work to ime1::gemm_kernel_i8i8.
+static void sqnbitgemm_spacemit_ime_i8i8(const size_t                        blk_len,
+                                         const size_t                        gemm_k,
+                                         const qnbitgemm_spacemit_ime_args * gemm_args,
+                                         void * const                        per_gemm_ws,
+                                         const size_t                        m_start,
+                                         const size_t                        m_count,
+                                         const size_t                        n_start,
+                                         const size_t                        n_count) {
+    constexpr size_t scale_stride = sizeof(uint16_t);
+    constexpr size_t blk_bitwidth = 8;
+
+    const size_t k_blks = div_round_up(gemm_k, blk_len);
+
+    const size_t      lda         = k_blks * q8_blk_size(blk_len);
+    const size_t      ldc         = gemm_args->ldc;
+    const size_t      ldb         = k_blks * (blk_len * blk_bitwidth / 8);  // = k_blks * blk_len for i8
+    const std::byte * quant_a_ptr = static_cast<const std::byte *>(per_gemm_ws) + m_start * lda;
+
+    // Q8_0 has no zero-point.
+    const size_t      packed_b_stride     = ldb + k_blks * scale_stride;
+    const std::byte * packed_quant_b_data = gemm_args->packed_quant_b_data + n_start * packed_b_stride;
+
+    float * c_ptr = gemm_args->c_ptr + m_start * ldc + n_start;
+
+    size_t       count_n               = 0;
+    const size_t compute_block_count_n = m_count == 1 ? n_count : 16;
+    for (size_t n = 0; n < n_count; n += count_n) {
+        count_n = std::min(n_count - n, compute_block_count_n);
+
+        const std::byte * a_row = quant_a_ptr;
+        const std::byte * b_col = packed_quant_b_data + n * packed_b_stride;
+        float *           c_blk = c_ptr + n;
+
+        int32_t rows_remaining = m_count;
+
+        while (rows_remaining > 0) {
+            const auto rows_handled = sqnbitgemm_spacemit_ime::ime1::gemm_kernel_i8i8(
+                blk_len, a_row, b_col, nullptr, nullptr, c_blk, rows_remaining, count_n, gemm_k, k_blks, ldc, nullptr,
+                scale_stride);
+
+            c_blk += rows_handled * ldc;
+            a_row += rows_handled * lda;
+
+            rows_remaining -= rows_handled;
+        }
+    }
+}
+
 template <int K> constexpr int QK_0() {
     if constexpr (K == 4) {
         return QK4_0;
@@ -225,6 +276,82 @@ static block_q4_1x16 make_block_q4_1x16(block_q4_1 * in, unsigned int blck_size_
     }
 
     return out;
+}
+
+static block_q8_0x16 make_block_q8_0x16(block_q8_0 * in) {
+    block_q8_0x16 out;
+    for (int i = 0; i < 16; i++) {
+        out.d[i] = in[i].d;
+    }
+    // Tiled layout consumed by SQ8BitGemmM{4,1}Kernel_CompInt8_ScaleFp16_Impl
+    // (see comment block above each kernel). For one packed K-block of QK8_0
+    // K-elements across 16 cols:
+    //   for each inner step i in [0, INNER) where INNER = QK8_0 / 16:
+    //     for each K-half h in {chunkA = 0, chunkB = 1}:
+    //       for each tile t in [0, 4):  // 4 tiles of 4 cols each
+    //         for each col_in_tile c in [0, 4):
+    //           col_global = t*4 + c
+    //           K_global   = i*8 + h*16        // chunkA: K=8i..8i+7,
+    //                                          // chunkB: K=8i+16..8i+23
+    //           dst[i*256 + h*128 + t*32 + c*8 + k] = in[col_global].qs[K_global + k]
+    // Total bytes: INNER * 256 = 16 * QK8_0.
+    constexpr int INNER = QK8_0 / 16;
+    for (int inner = 0; inner < INNER; inner++) {
+        for (int half = 0; half < 2; half++) {
+            for (int tile = 0; tile < 4; tile++) {
+                for (int col_in_tile = 0; col_in_tile < 4; col_in_tile++) {
+                    const int col    = tile * 4 + col_in_tile;
+                    // A buffer (from quantize_a_4row_i8) is sequential in K:
+                    //   half=0 within inner -> K[inner*16 .. inner*16+7]
+                    //   half=1 within inner -> K[inner*16+8 .. inner*16+15]
+                    // The B layout must mirror this so vmadot pairs A K=x..x+7
+                    // with B K=x..x+7 (otherwise we cross-multiply mismatched
+                    // K positions and produce garbage).
+                    const int K_base = inner * 16 + half * 8;
+                    for (int k = 0; k < 8; k++) {
+                        const int dst_offset = inner * 256 + half * 128 + tile * 32 + col_in_tile * 8 + k;
+                        out.qs[dst_offset]   = static_cast<uint8_t>(in[col].qs[K_base + k]);
+                    }
+                }
+            }
+        }
+    }
+    return out;
+}
+
+static int repack_q8_0_to_q8_0_16_bl(struct ggml_tensor *       t,
+                                     int                        interleave_block,
+                                     const void * GGML_RESTRICT data,
+                                     size_t                     data_size) {
+    GGML_ASSERT(t->type == GGML_TYPE_Q8_0);
+    GGML_ASSERT(interleave_block == 16);
+
+    constexpr int nrows_interleaved = 16;
+
+    block_q8_0x16 *    dst = (block_q8_0x16 *) t->data;
+    const block_q8_0 * src = (const block_q8_0 *) data;
+    block_q8_0         dst_tmp[16];
+    int                nrow    = ggml_nrows(t);
+    int                nblocks = t->ne[0] / QK8_0;
+
+    GGML_ASSERT(data_size == nrow * nblocks * sizeof(block_q8_0));
+
+    if (t->ne[1] % nrows_interleaved != 0 || t->ne[0] % QK8_0 != 0) {
+        return -1;
+    }
+
+    for (int b = 0; b < nrow; b += nrows_interleaved) {
+        for (int64_t x = 0; x < nblocks; x++) {
+            for (int i = 0; i < nrows_interleaved; i++) {
+                dst_tmp[i] = src[x + i * nblocks];
+            }
+            *dst++ = make_block_q8_0x16(dst_tmp);
+        }
+        src += nrows_interleaved * nblocks;
+    }
+    return 0;
+
+    GGML_UNUSED(data_size);
 }
 
 static int repack_q4_0_to_q4_0_16_bl(struct ggml_tensor *       t,
@@ -384,6 +511,10 @@ template <> int repack<block_q4_K, 8, 16>(struct ggml_tensor * t, const void * d
     return repack_q4_k_to_q4_1_16_bl(t, 16, data, data_size);
 }
 
+template <> int repack<block_q8_0, 8, 16>(struct ggml_tensor * t, const void * data, size_t data_size) {
+    return repack_q8_0_to_q8_0_16_bl(t, 16, data, data_size);
+}
+
 class tensor_traits_base : public ggml::cpu::tensor_traits {
   public:
     virtual int repack(struct ggml_tensor * t, const void * data, size_t data_size) = 0;
@@ -408,7 +539,8 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
             case GGML_OP_MUL_MAT:
                 if (op->src[0]->type == GGML_TYPE_Q4_0 ||  //
                     op->src[0]->type == GGML_TYPE_Q4_1 ||  //
-                    op->src[0]->type == GGML_TYPE_Q4_K) {
+                    op->src[0]->type == GGML_TYPE_Q4_K ||  //
+                    op->src[0]->type == GGML_TYPE_Q8_0) {
                     forward_mul_mat_q4(params, op);
                     return true;
                 }
@@ -462,7 +594,8 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
             qnbitgemm_args[i].packed_quant_b_data = (const std::byte *) w_data;
             qnbitgemm_args[i].quant_b_scale       = nullptr;
 
-            if constexpr (std::is_same_v<BLOC_TYPE, block_q4_0>) {
+            if constexpr (std::is_same_v<BLOC_TYPE, block_q4_0> ||
+                          std::is_same_v<BLOC_TYPE, block_q8_0>) {
                 qnbitgemm_args[i].quant_b_zp = nullptr;
             } else {
                 qnbitgemm_args[i].quant_b_zp = w_data;
@@ -550,7 +683,11 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
 
                 void * per_gemm_ws = reinterpret_cast<std::byte *>(ws) + gemm_i * per_gemm_workspace_stride;
 
-                sqnbitgemm_spacemit_ime_i8i4(QK4_0, gemm_k, data, per_gemm_ws, m_start, m_count, n_start, n_count);
+                if constexpr (std::is_same_v<BLOC_TYPE, block_q8_0>) {
+                    sqnbitgemm_spacemit_ime_i8i8(QK8_0, gemm_k, data, per_gemm_ws, m_start, m_count, n_start, n_count);
+                } else {
+                    sqnbitgemm_spacemit_ime_i8i4(QK4_0, gemm_k, data, per_gemm_ws, m_start, m_count, n_start, n_count);
+                }
             }
         }
     }
@@ -840,6 +977,7 @@ class tensor_traits_common : public tensor_traits_base {
 static const tensor_traits<block_q4_0, 8, 16> q4_0_16x8_q8_0;
 static const tensor_traits<block_q4_1, 8, 16> q4_1_16x8_q8_0;
 static const tensor_traits<block_q4_K, 8, 16> q4_k_16x8_q8_0;
+static const tensor_traits<block_q8_0, 8, 16> q8_0_16x8_q8_0;
 static const tensor_traits_common             rvv_impl;
 
 }  // namespace ggml::cpu::riscv64_spacemit
@@ -856,6 +994,10 @@ static const ggml::cpu::tensor_traits * ggml_riscv64_spacemit_get_optimal_repack
     } else if (cur->type == GGML_TYPE_Q4_K) {
         if (cur->ne[1] % 16 == 0) {
             return &ggml::cpu::riscv64_spacemit::q4_k_16x8_q8_0;
+        }
+    } else if (cur->type == GGML_TYPE_Q8_0) {
+        if (cur->ne[1] % 16 == 0) {
+            return &ggml::cpu::riscv64_spacemit::q8_0_16x8_q8_0;
         }
     } else if (cur->type == GGML_TYPE_F32) {
         return &ggml::cpu::riscv64_spacemit::rvv_impl;
