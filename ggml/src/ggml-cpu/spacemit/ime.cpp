@@ -983,6 +983,13 @@ static const tensor_traits_common             rvv_impl;
 }  // namespace ggml::cpu::riscv64_spacemit
 
 static const ggml::cpu::tensor_traits * ggml_riscv64_spacemit_get_optimal_repack_type(const struct ggml_tensor * cur) {
+    // The IME GEMM kernels assume a single weight matrix (batch_weight == 1, see
+    // forward_mul_mat_q4). Batched weight tensors must fall back to the standard
+    // path; rejecting them here keeps tensor->extra unset so the standard path
+    // takes over rather than aborting at compute time.
+    if (ggml_n_dims(cur) > 2) {
+        return nullptr;
+    }
     if (cur->type == GGML_TYPE_Q4_0) {
         if (cur->ne[1] % 16 == 0) {
             return &ggml::cpu::riscv64_spacemit::q4_0_16x8_q8_0;
