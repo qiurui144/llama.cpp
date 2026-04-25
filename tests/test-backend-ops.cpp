@@ -485,6 +485,7 @@ enum test_mode {
     MODE_PERF,
     MODE_GRAD,
     MODE_SUPPORT,
+    MODE_EXTRA_BUFTS,
 };
 
 // Output format support similar to llama-bench
@@ -1207,7 +1208,7 @@ struct test_case {
     std::string current_op_name;
 
     void add_sentinel(ggml_context * ctx) {
-        if (mode == MODE_PERF || mode == MODE_GRAD || mode == MODE_SUPPORT) {
+        if (mode == MODE_PERF || mode == MODE_GRAD || mode == MODE_SUPPORT || mode == MODE_EXTRA_BUFTS) {
             return;
         }
         ggml_tensor * sentinel = ::ggml_new_tensor_1d(ctx, GGML_TYPE_F32, sentinel_size);
@@ -1450,6 +1451,315 @@ struct test_case {
         }
 
         return test_passed ? test_status_t::OK : test_status_t::FAIL;
+    }
+
+    // Evaluate the test against the SpacemiT IME extra_buffer_type. The op
+    // (currently only MUL_MAT) has its weight tensor (src0) allocated to the
+    // IME buft so the CPU backend dispatches the kernel through the IME
+    // path (vmadot). Output is compared against the same CPU backend running
+    // with the default host buft (reference scalar path).
+    //
+    // Implementation: manual two-pass execution against the *same*
+    // backend_cpu (because IME and reference both live on the CPU backend,
+    // only the buft differs). We avoid
+    // ggml_backend_compare_graph_backend(b1, b2, ...) since it deadlocks
+    // when b1 == b2.
+    //
+    //   pass 1 (reference): all tensors on cpu_buft. Randomize via
+    //                       initialize_tensors, capture leaf input raw bytes
+    //                       (safe — cpu_buft has linear layout), compute,
+    //                       collect output (out_ref).
+    //   pass 2 (IME path):  weight on the IME buft, rest on cpu_buft. Write
+    //                       the captured raw bytes into each leaf — IME's
+    //                       set_tensor hook will repack the weight on write.
+    //                       Compute, collect output (out_ime).
+    //   compare:            dequantize/cast outputs to float and run
+    //                       test_case::err() vs max_err().
+    //
+    //   Doing the reference pass first lets us read back leaf bytes from a
+    //   plain cpu_buft buffer. Capturing from a repacked IME weight would
+    //   be unsafe — the buft's get_tensor may not exist or may segfault on
+    //   padded layouts.
+    test_status_t eval_extra_buft(ggml_backend_t            backend_cpu,
+                                  ggml_backend_buffer_type_t extra_buft,
+                                  const char *               op_names_filter,
+                                  printer *                  output_printer) {
+        mode = MODE_EXTRA_BUFTS;
+
+        const std::string buft_label = std::string("CPU/") + ggml_backend_buft_name(extra_buft);
+
+        ggml_backend_buffer_type_t cpu_buft = ggml_backend_get_default_buffer_type(backend_cpu);
+
+        // ---- Probe phase: build a throwaway graph just to inspect the op + weight type ----
+        ggml_init_params probe_params = {
+            /* .mem_size = */ ggml_tensor_overhead()*128 + ggml_graph_overhead(),
+            /* .mem_base = */ NULL,
+            /* .no_alloc = */ true,
+        };
+        ggml_context * probe_ctx = ggml_init(probe_params);
+        GGML_ASSERT(probe_ctx);
+        gf                  = ggml_new_graph(probe_ctx);
+        ggml_tensor * probe_out = build_graph(probe_ctx);
+        current_op_name        = op_desc(probe_out);
+
+        if (!matches_filter(probe_out, op_names_filter)) {
+            ggml_free(probe_ctx);
+            return test_status_t::SKIPPED;
+        }
+
+        if (probe_out->op != GGML_OP_MUL_MAT) {
+            ggml_free(probe_ctx);
+            return test_status_t::SKIPPED;
+        }
+
+        ggml_tensor * probe_weight = probe_out->src[0];
+        while (probe_weight && probe_weight->view_src != nullptr) {
+            probe_weight = probe_weight->view_src;
+        }
+        if (probe_weight == nullptr) {
+            ggml_free(probe_ctx);
+            return test_status_t::SKIPPED;
+        }
+        const ggml_type wt = probe_weight->type;
+        const bool wt_ok =
+            wt == GGML_TYPE_Q4_0 || wt == GGML_TYPE_Q4_1 ||
+            wt == GGML_TYPE_Q4_K || wt == GGML_TYPE_Q5_K ||
+            wt == GGML_TYPE_Q6_K || wt == GGML_TYPE_Q8_0;
+        if (!wt_ok) {
+            ggml_free(probe_ctx);
+            return test_status_t::SKIPPED;
+        }
+
+        // Skip batched-weight shapes: this harness allocates weight on the
+        // extra_buft unconditionally (bypassing the scheduler), and the IME
+        // path crashes in set_tensor / compute when the weight is batched
+        // because get_optimal_repack_type rejects and tensor->extra stays null.
+        if (probe_weight->ne[2] > 1 || probe_weight->ne[3] > 1) {
+            ggml_free(probe_ctx);
+            return test_status_t::SKIPPED;
+        }
+
+        // Skip non-F32 activation cases: the standard CPU quantized MUL_MAT
+        // path asserts src1->type == GGML_TYPE_F32 (ggml-cpu.c) when src1
+        // needs conversion to vec_dot_type but isn't F32. extra_buft
+        // supports_op rejects non-F32 src1, but if scheduler routes to the
+        // default CPU path the assert would abort the test run.
+        if (probe_out->src[1] && probe_out->src[1]->type != GGML_TYPE_F32) {
+            ggml_free(probe_ctx);
+            return test_status_t::SKIPPED;
+        }
+
+        const std::string vars_str = vars();
+
+        ggml_free(probe_ctx);  // probe done; build fresh contexts for each pass
+
+        // ---------------------------------------------------------------------------------
+        // PASS 1: REFERENCE — all tensors on cpu_buft. Randomize, capture leaf raw bytes
+        // (safe: cpu_buft is linear layout), compute, collect out_ref.
+        // ---------------------------------------------------------------------------------
+        ggml_init_params params1 = {
+            /* .mem_size = */ ggml_tensor_overhead()*128 + ggml_graph_overhead(),
+            /* .mem_base = */ NULL,
+            /* .no_alloc = */ true,
+        };
+        ggml_context * ctx1 = ggml_init(params1);
+        GGML_ASSERT(ctx1);
+        gf = ggml_new_graph(ctx1);
+        ggml_tensor * out_ref_t = build_graph(ctx1);
+
+        ggml_backend_buffer_t buf_ref = ggml_backend_alloc_ctx_tensors_from_buft(ctx1, cpu_buft);
+        if (buf_ref == NULL) {
+            printf("failed to allocate CPU tensors (ref pass) for [%s] ", buft_label.c_str());
+            ggml_free(ctx1);
+            return test_status_t::FAIL;
+        }
+        ggml_build_forward_expand(gf, out_ref_t);
+
+        // randomize all tensors on cpu_buft (linear layout, no repack involved)
+        initialize_tensors(ctx1);
+
+        // capture leaf input raw bytes (cpu_buft is safe to read via tensor_get)
+        std::unordered_map<std::string, std::vector<uint8_t>> input_raw;
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx1); t != NULL; t = ggml_get_next_tensor(ctx1, t)) {
+            if (t->src[0] != nullptr) {
+                continue;  // not a leaf
+            }
+            if (strncmp(t->name, "sent_", 5) == 0) {
+                continue;  // sentinel (shouldn't appear in EXTRA_BUFTS mode but be defensive)
+            }
+            const size_t nb = ggml_nbytes(t);
+            std::vector<uint8_t> buf(nb);
+            ggml_backend_tensor_get(t, buf.data(), 0, nb);
+            input_raw.emplace(std::string(t->name), std::move(buf));
+        }
+
+        ggml_status st1 = ggml_backend_graph_compute(backend_cpu, gf);
+        if (st1 != GGML_STATUS_SUCCESS) {
+            fflush(stderr);
+            ggml_backend_buffer_free(buf_ref);
+            ggml_free(ctx1);
+            return test_status_t::FAIL;
+        }
+        std::vector<float> out_ref = tensor_to_float(out_ref_t);
+
+        ggml_backend_buffer_free(buf_ref);
+        ggml_free(ctx1);
+
+        // ---------------------------------------------------------------------------------
+        // PASS 2: IME — weight on extra_buft, rest on cpu_buft. Replay captured raw bytes
+        // (set_tensor on the IME-buft weight will repack on write). Compute, collect out_ime.
+        // ---------------------------------------------------------------------------------
+        ggml_init_params params2 = {
+            /* .mem_size = */ ggml_tensor_overhead()*128 + ggml_graph_overhead(),
+            /* .mem_base = */ NULL,
+            /* .no_alloc = */ true,
+        };
+        ggml_context * ctx2 = ggml_init(params2);
+        GGML_ASSERT(ctx2);
+        gf = ggml_new_graph(ctx2);
+        ggml_tensor * out_ime_t = build_graph(ctx2);
+
+        ggml_tensor * weight2 = out_ime_t->src[0];
+        while (weight2 && weight2->view_src != nullptr) {
+            weight2 = weight2->view_src;
+        }
+        GGML_ASSERT(weight2 != nullptr);
+
+        const size_t wbytes = ggml_backend_buft_get_alloc_size(extra_buft, weight2);
+        ggml_backend_buffer_t weight_buf = ggml_backend_buft_alloc_buffer(extra_buft, wbytes);
+        if (weight_buf == nullptr) {
+            ggml_free(ctx2);
+            return test_status_t::SKIPPED;
+        }
+        if (ggml_backend_tensor_alloc(weight_buf, weight2,
+                                      ggml_backend_buffer_get_base(weight_buf)) != GGML_STATUS_SUCCESS) {
+            ggml_backend_buffer_free(weight_buf);
+            ggml_free(ctx2);
+            return test_status_t::SKIPPED;
+        }
+
+        // supports_op check: extra_buft's repack/IME path must accept this op
+        bool supported = true;
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx2); t != NULL; t = ggml_get_next_tensor(ctx2, t)) {
+            if (!ggml_backend_supports_op(backend_cpu, t)) {
+                supported = false;
+                break;
+            }
+        }
+        if (!supported) {
+            test_result result(buft_label, current_op_name, vars_str, "extra_bufts",
+                               false, false, "not supported");
+            if (output_printer) {
+                output_printer->print_test_result(result);
+            }
+            ggml_backend_buffer_free(weight_buf);
+            ggml_free(ctx2);
+            return test_status_t::NOT_SUPPORTED;
+        }
+
+        ggml_backend_buffer_t rest_buf2 = ggml_backend_alloc_ctx_tensors_from_buft(ctx2, cpu_buft);
+        if (rest_buf2 == NULL) {
+            printf("failed to allocate CPU tensors (IME pass) for [%s] ", buft_label.c_str());
+            ggml_backend_buffer_free(weight_buf);
+            ggml_free(ctx2);
+            return test_status_t::FAIL;
+        }
+        ggml_build_forward_expand(gf, out_ime_t);
+
+        // Replay captured raw bytes onto pass2 leaves. Names are stable across build_graph calls.
+        size_t restored = 0;
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx2); t != NULL; t = ggml_get_next_tensor(ctx2, t)) {
+            if (t->src[0] != nullptr) {
+                continue;
+            }
+            if (strncmp(t->name, "sent_", 5) == 0) {
+                continue;
+            }
+            auto it = input_raw.find(std::string(t->name));
+            if (it == input_raw.end()) {
+                fflush(stderr);
+                ggml_backend_buffer_free(rest_buf2);
+                ggml_backend_buffer_free(weight_buf);
+                ggml_free(ctx2);
+                return test_status_t::FAIL;
+            }
+            const size_t nb_t = ggml_nbytes(t);
+            // ggml_nbytes returns the logical size from ne/nb. extra_buft may pad the underlying
+            // buffer (wbytes >= nb_t) but set_tensor takes logical bytes which the buft hook
+            // reads + repacks.
+            if (it->second.size() != nb_t) {
+                ggml_backend_buffer_free(rest_buf2);
+                ggml_backend_buffer_free(weight_buf);
+                ggml_free(ctx2);
+                return test_status_t::FAIL;
+            }
+            ggml_backend_tensor_set(t, it->second.data(), 0, nb_t);
+            restored++;
+        }
+
+        ggml_status st2 = ggml_backend_graph_compute(backend_cpu, gf);
+        if (st2 != GGML_STATUS_SUCCESS) {
+            fflush(stderr);
+            ggml_backend_buffer_free(rest_buf2);
+            ggml_backend_buffer_free(weight_buf);
+            ggml_free(ctx2);
+            return test_status_t::FAIL;
+        }
+        std::vector<float> out_ime = tensor_to_float(out_ime_t);
+
+        ggml_backend_buffer_free(rest_buf2);
+        ggml_backend_buffer_free(weight_buf);
+        ggml_free(ctx2);
+
+        // ---------------------------------------------------------------------------------
+        // Compare: out_ime (test path) vs out_ref (reference)
+        // ---------------------------------------------------------------------------------
+        // Bind the names used downstream so the comparator block doesn't need rewriting.
+        std::vector<float> & out1 = out_ime;
+        std::vector<float> & out2 = out_ref;
+        if (out1.size() != out2.size()) {
+            printf("[%s] output size mismatch: ime=%zu ref=%zu ",
+                   current_op_name.c_str(), out1.size(), out2.size());
+            test_result result(buft_label, current_op_name, vars_str, "extra_bufts",
+                               true, false, "size mismatch");
+            if (output_printer) {
+                output_printer->print_test_result(result);
+            }
+            return test_status_t::FAIL;
+        }
+
+        bool ok = true;
+        for (size_t i = 0; i < out1.size(); i++) {
+            if (std::isnan(out1[i]) || std::isnan(out2[i])) {
+                printf("[%s] NaN at index %zu (%s=%f CPU(ref)=%f) ",
+                       current_op_name.c_str(), i, buft_label.c_str(), out1[i], out2[i]);
+                ok = false;
+                break;
+            }
+        }
+        double err_val = 0.0;
+        if (ok) {
+            err_val = err(out1.data(), out2.data(), out1.size());
+            if (err_val > max_err()) {
+                printf("[%s] ERR = %.9f > %.9f ",
+                       current_op_name.c_str(), err_val, max_err());
+                ok = false;
+            }
+        }
+
+        std::string error_msg;
+        if (!ok) {
+            char buf[64];
+            snprintf(buf, sizeof(buf), "ERR=%.6g", err_val);
+            error_msg = buf;
+        }
+        test_result result(buft_label, current_op_name, vars_str, "extra_bufts",
+                           true, ok, error_msg);
+        if (output_printer) {
+            output_printer->print_test_result(result);
+        }
+
+        return ok ? test_status_t::OK : test_status_t::FAIL;
     }
 
     bool eval_perf(ggml_backend_t backend, const char * op_names_filter, printer * output_printer) {
@@ -9180,6 +9490,7 @@ static bool test_backend(ggml_backend_t backend, test_mode mode, const char * op
         case MODE_TEST:
         case MODE_GRAD:
         case MODE_SUPPORT:
+        case MODE_EXTRA_BUFTS:
             test_cases = make_test_cases_eval();
             break;
         case MODE_PERF:
@@ -9263,6 +9574,80 @@ static bool test_backend(ggml_backend_t backend, test_mode mode, const char * op
             test->eval_support(backend, op_names_filter, output_printer);
         }
         return true;
+    }
+
+    if (mode == MODE_EXTRA_BUFTS) {
+        // For extra_bufts mode, the "backend" is always the CPU backend (extra_bufts hang off
+        // the CPU device). We discover the device's extra buffer types via the
+        // "ggml_backend_dev_get_extra_bufts" proc address and verify each kernel against the
+        // CPU backend's reference (default-buft) path.
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+
+        using get_extra_bufts_fn = ggml_backend_buffer_type_t * (*)(ggml_backend_dev_t);
+        auto get_extra_bufts = (get_extra_bufts_fn) ggml_backend_reg_get_proc_address(
+            reg, "ggml_backend_dev_get_extra_bufts");
+        if (get_extra_bufts == nullptr) {
+            printf("backend %s does not expose ggml_backend_dev_get_extra_bufts; nothing to test\n",
+                   ggml_backend_dev_name(dev));
+            return true;
+        }
+
+        ggml_backend_buffer_type_t * extra_bufts = get_extra_bufts(dev);
+        if (extra_bufts == nullptr || extra_bufts[0] == nullptr) {
+            printf("backend %s exposes no extra buffer types\n", ggml_backend_dev_name(dev));
+            return true;
+        }
+
+        // Filter out fusion cases (they don't apply here)
+        test_cases.erase(
+            std::remove_if(test_cases.begin(), test_cases.end(), [](const std::unique_ptr<test_case> & tc) {
+                return tc->run_whole_graph();
+            }),
+            test_cases.end()
+        );
+
+        // Use the reference scalar implementation on the comparison side so any divergence is
+        // attributable to the extra_buft kernel, not to a vectorised SIMD CPU kernel.
+        using ggml_backend_cpu_set_use_ref_t = void (*)(ggml_backend_t, bool);
+        auto * set_use_ref = (ggml_backend_cpu_set_use_ref_t) ggml_backend_reg_get_proc_address(
+            reg, "ggml_backend_cpu_set_use_ref");
+        if (set_use_ref) {
+            set_use_ref(backend, true);
+        }
+
+        size_t                   n_ok          = 0;
+        size_t                   tests_run     = 0;
+        std::vector<std::string> failed_tests;
+
+        for (size_t bi = 0; extra_bufts[bi] != nullptr; bi++) {
+            ggml_backend_buffer_type_t buft = extra_bufts[bi];
+            printf("\n  extra_buft: %s\n", ggml_backend_buft_name(buft));
+
+            for (auto & test : test_cases) {
+                test_status_t status = test->eval_extra_buft(backend, buft, op_names_filter,
+                                                             output_printer);
+                if (status == test_status_t::SKIPPED || status == test_status_t::NOT_SUPPORTED) {
+                    continue;
+                }
+                tests_run++;
+                if (status == test_status_t::OK) {
+                    n_ok++;
+                } else if (status == test_status_t::FAIL) {
+                    failed_tests.push_back(std::string(ggml_backend_buft_name(buft)) + " :: " +
+                                           test->current_op_name + "(" + test->vars() + ")");
+                }
+            }
+        }
+
+        if (set_use_ref) {
+            set_use_ref(backend, false);
+        }
+
+        output_printer->print_summary(test_summary_info(n_ok, tests_run, false));
+        output_printer->print_failed_tests(failed_tests);
+
+        return n_ok == tests_run;
     }
 
     GGML_ABORT("fatal error");
@@ -9376,6 +9761,8 @@ static void usage(char ** argv) {
     printf("      - grad (compare gradients from backpropagation with method of finite differences)\n");
     printf("      - perf (performance evaluation)\n");
     printf("      - support (probe backend operation support)\n");
+    printf("      - extra_bufts (validate the SpacemiT IME CPU extra_buffer_type kernels\n");
+    printf("                     against the CPU backend reference implementation)\n");
     printf("    op names for -o are as given by ggml_op_desc() (e.g. ADD, MUL_MAT, etc),\n");
     printf("        optionally including the full test case string (e.g. \"ADD(type=f16,ne=[1,1,8,1],nr=[1,1,1,1],nf=1)\")\n");
     printf("    --output specifies output format (default: console, options: console, sql, csv)\n");
@@ -9401,6 +9788,8 @@ int main(int argc, char ** argv) {
             mode = MODE_GRAD;
         } else if (strcmp(argv[i], "support") == 0) {
             mode = MODE_SUPPORT;
+        } else if (strcmp(argv[i], "extra_bufts") == 0) {
+            mode = MODE_EXTRA_BUFTS;
         } else if (strcmp(argv[i], "-o") == 0) {
             if (i + 1 < argc) {
                 op_names_filter = argv[++i];
@@ -9474,9 +9863,20 @@ int main(int argc, char ** argv) {
             continue;
         }
 
-        if (backend_filter == NULL && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU && mode != MODE_GRAD) {
+        if (backend_filter == NULL && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU &&
+            mode != MODE_GRAD && mode != MODE_EXTRA_BUFTS) {
             output_printer->print_backend_init(backend_init_info(
                 i, ggml_backend_dev_count(), ggml_backend_dev_name(dev), true, "Skipping CPU backend"));
+            n_ok++;
+            continue;
+        }
+
+        // For extra_bufts mode, only the CPU device is meaningful (extra_bufts hang off the CPU
+        // device). Skip non-CPU devices to avoid running irrelevant tests.
+        if (mode == MODE_EXTRA_BUFTS && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+            output_printer->print_backend_init(backend_init_info(
+                i, ggml_backend_dev_count(), ggml_backend_dev_name(dev), true,
+                "Skipping non-CPU backend (extra_bufts mode)"));
             n_ok++;
             continue;
         }
